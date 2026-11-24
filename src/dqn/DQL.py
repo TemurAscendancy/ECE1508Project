@@ -148,54 +148,61 @@ class DQL():
         self.env.close()
 
 
-    def play(self):
+    def play(self, weights=None):
         """
-        play with the learned policy
-        You can only run it if you already have trained the DQN and saved its weights as .pth file
-        Plays greedily on the held-out val checkpoints and reports the win rate
+        play greedily on the held-out val checkpoints and report the win rate
+        weights: list of .pth files to evaluate (default: <run_dir>/final_weights.pth)
+                 "random" = random legal-action baseline
+        every policy gets the same scenarios (reset(seed=1..n)), so the results are comparable
         """
-
-        # Load the trained DQN
-        self.agent.onlineDQN.load_state_dict(torch.load(self.hp.RL_load_path, map_location=torch.device(self.agent.device)))
-        self.agent.onlineDQN.eval()
-
-        outcomes = Counter()
-        # Playing
-        for episode in range(1, self.hp.num_test_episodes+1):
-            state, info = self.env.reset(seed=episode)
-            mask = info["action_mask"]
-            ended = False
-            truncated = False
-            step_size = 0
-            episode_reward = 0
-
-            while not ended and not truncated:
-                # Find the feature of <state> using <self.feature_representation>
-                # Act greedy (over legal actions) and find <action>
-                state = self.feature_representation(state)
-                action = self.agent.greedy(state, mask)
-
-                next_state, reward, ended, truncated, info = self.env.step(action)
-
-                state = next_state
-                mask = info["action_mask"]
-                episode_reward += reward
-                step_size += 1
-
-            outcome = "win" if info["won"] else "loss" if info["won"] is False else "trunc" if truncated else "tie"
-            outcomes[outcome] += 1
-            # Print Results of Episode
-            printout = (f"Episode: {episode}, "
-                      f"Steps: {step_size:}, "
-                      f"Sum Reward of Episode: {episode_reward:.2f}, "
-                      f"Outcome: {outcome}, "
-                      f"Opponent: {info['opponent']}")
-            print(printout)
-
+        weights = weights or [self.hp.RL_load_path]
+        verbose = len(weights) == 1  # per-episode lines only when evaluating one policy
+        rng = np.random.default_rng(123)
         n = self.hp.num_test_episodes
-        print(f"\nWin rate: {outcomes['win'] / n:.3f}  "
-              f"(win {outcomes['win']}, loss {outcomes['loss']}, "
-              f"trunc {outcomes['trunc']}, tie {outcomes['tie']}, of {n})")
+
+        for path in weights:
+            if path != "random":
+                self.agent.onlineDQN.load_state_dict(torch.load(path, map_location=torch.device(self.agent.device)))
+                self.agent.onlineDQN.eval()
+
+            outcomes, per_opp, total_steps = Counter(), {}, 0
+            for episode in range(1, n + 1):
+                state, info = self.env.reset(seed=episode)
+                mask = info["action_mask"]
+                ended = False
+                truncated = False
+                step_size = 0
+                episode_reward = 0
+
+                while not ended and not truncated:
+                    # act greedy over the legal actions (or uniformly at random for the baseline)
+                    if path == "random":
+                        action = int(rng.choice(np.flatnonzero(mask)))
+                    else:
+                        action = self.agent.greedy(self.feature_representation(state), mask)
+
+                    state, reward, ended, truncated, info = self.env.step(action)
+                    mask = info["action_mask"]
+                    episode_reward += reward
+                    step_size += 1
+
+                outcome = "win" if info["won"] else "loss" if info["won"] is False else "trunc" if truncated else "tie"
+                outcomes[outcome] += 1
+                per_opp.setdefault(info["opponent"], Counter())[outcome] += 1
+                total_steps += step_size
+                if verbose:
+                    print(f"Episode: {episode}, "
+                          f"Steps: {step_size:}, "
+                          f"Sum Reward of Episode: {episode_reward:.2f}, "
+                          f"Outcome: {outcome}, "
+                          f"Opponent: {info['opponent']}")
+
+            by_opp = " ".join(f"{k}={v['win'] / sum(v.values()):.3f} (n={sum(v.values())})"
+                              for k, v in sorted(per_opp.items()))
+            print(f"\n{os.path.basename(path)}: win rate {outcomes['win'] / n:.3f}  "
+                  f"(win {outcomes['win']}, loss {outcomes['loss']}, "
+                  f"trunc {outcomes['trunc']}, tie {outcomes['tie']}, of {n}), "
+                  f"avg decisions {total_steps / n:.2f} | {by_opp}", flush=True)
         self.env.close()
 
     def plot_learning_curves(self):

@@ -139,7 +139,12 @@ class Agent:
         self.replay_buffer = Replay_Buffer(self.hp.buffer_size, device = self.device)
 
         # Initiate the online and Target DQNs
+        # per_mon: one Q head per active pokemon (2 x 25 outputs) instead of one
+        # Q-value per joint action (625 outputs), see joint_q / apply_SGD
         num_actions = self.action_space.n
+        self.slot_actions = int(round(np.sqrt(num_actions)))
+        if self.hp.per_mon:
+            num_actions = 2 * self.slot_actions
         feature_size = self.feature_space.shape[0]
         self.onlineDQN = DQN(num_actions = num_actions, feature_size = feature_size)
         self.onlineDQN.to(self.device)
@@ -152,6 +157,12 @@ class Agent:
         # set the optimizer to Adam and call it <self.optimizer>, i.e., self.optimizer = optim.Adam()
         self.optimizer = torch.optim.Adam(self.onlineDQN.parameters(), lr=self.hp.learning_rate)
 
+
+    def joint_q(self, output):
+        if not self.hp.per_mon:
+            return output
+        q = output.reshape(*output.shape[:-1], 2, self.slot_actions)
+        return (q[..., 0, :, None] + q[..., 1, None, :]).flatten(start_dim=-2)
 
     def masked_argmax(self, q_values, mask):
         """
@@ -167,7 +178,7 @@ class Agent:
         """
         # This function should return the action chosen by epsilon greedy algorithm #
         with torch.no_grad():
-            output = self.onlineDQN(state) # should be (num_actions,)
+            output = self.joint_q(self.onlineDQN(state)) # should be (num_actions,)
             random_value = np.random.rand()
             if random_value < self.epsilon:
                 # uniform over the legal actions
@@ -182,7 +193,7 @@ class Agent:
         """
         # This function should return the action chosen by greedy algorithm #
         with torch.no_grad():
-            output = self.onlineDQN(state) # should be (num_actions,)
+            output = self.joint_q(self.onlineDQN(state)) # should be (num_actions,)
             return self.masked_argmax(output, mask)
 
 
@@ -197,23 +208,40 @@ class Agent:
         # Sample from the replay buffer
         states, actions, next_states, rewards, terminals, next_masks = self.replay_buffer.sample(self.hp.batch_size)
 
-        actions = actions.unsqueeze(1)
+        # Q heads: joint = 1 head over the 625 joint actions
+        # per_mon = 2 heads (one per pokemon) over its 25 actions. Each pokemon is its own
+        # Q-learner on the team reward, its ally's choice is just part of the environment
+        if self.hp.per_mon:
+            S = self.slot_actions
+            actions = torch.stack([actions // S, actions % S], dim=1)                     # batch_size x 2
+            joint_masks = next_masks.reshape(-1, S, S)
+            next_masks = torch.stack([joint_masks.any(2), joint_masks.any(1)], dim=1)  # batch_size x 2 x S
+        else:
+            actions = actions.unsqueeze(1)                                               # batch_size x 1
+            next_masks = next_masks.unsqueeze(1)                                         # batch_size x 1 x 625
+        heads = lambda net, x: net(x).reshape(next_masks.shape)                          # batch_size x heads x actions per head
         rewards = rewards.unsqueeze(1)
         terminals = terminals.unsqueeze(1)
 
         # Compute <Q_hat> using the online DQN
-        # states should be batch_size x feature_size, rewards is batch_size x 1, actions is batch_size x 1
-        Q_hat = self.onlineDQN(states).gather(1, actions) # should be batch_size x 1
+        # states should be batch_size x feature_size, rewards is batch_size x 1, actions is batch_size x heads
+        Q_hat = heads(self.onlineDQN, states).gather(2, actions.unsqueeze(2)).squeeze(2) # should be batch_size x heads
 
         with torch.no_grad():
             # Compute the maximum Q-value (over legal next actions) for off-policy update and call it <next_target_q_value>
-            next_target_q = self.targetDQN(next_states) # should be batch_size x num_actions
-            next_target_q = next_target_q.masked_fill(~next_masks, -1e9) # illegal next actions can't be the max
-            next_target_q_value, _ = torch.max(next_target_q, dim=1) # should be (batch_size,)
-            next_target_q_value = next_target_q_value.reshape(-1, 1) # should be batch_size x 1
+            next_target_q = heads(self.targetDQN, next_states) # should be batch_size x heads x actions per head
+            if self.hp.double_dqn:
+                # Double DQN: the online DQN picks the best legal next action and the
+                # target DQN evaluates it (reduces the max-operator overestimation)
+                next_online_q = heads(self.onlineDQN, next_states).masked_fill(~next_masks, -1e9)
+                next_actions = torch.argmax(next_online_q, dim=2, keepdim=True)
+                next_target_q_value = next_target_q.gather(2, next_actions).squeeze(2) # should be batch_size x heads
+            else:
+                next_target_q = next_target_q.masked_fill(~next_masks, -1e9) # illegal next actions can't be the max
+                next_target_q_value, _ = torch.max(next_target_q, dim=2) # should be batch_size x heads
 
 
-        next_target_q_value[terminals] = 0 # Set Q-value for terminal states to zero (their mask is all zeros)
+        next_target_q_value[terminals.expand_as(next_target_q_value)] = 0 # Set Q-value for terminal states to zero (their mask is all zeros)
         # Compute the Q-estimator and call it <y>
         y = rewards + self.hp.discount_factor * next_target_q_value
         loss = self.loss_function(Q_hat, y) # Compute the loss

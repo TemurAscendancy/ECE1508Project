@@ -21,7 +21,9 @@ class Hyperparameters():
         # project specific 
         self.learning_starts = 1000           # transitions in the buffer before SGD starts
         self.hp_shaping = 0.0                 # 0 = sparse +-1 reward (see EndgameEnv)
-        self.max_turns = 30                   # truncate the episode after this many turns
+        self.double_dqn = False               # True: online net picks the next action, target net evaluates it
+        self.per_mon = False                  # True: one Q head per pokemon (2 x 25 outputs) instead of 625 joint actions
+        self.max_turns = 30                  # truncate the episode after this many turns
         self.ally_targets = True              # 625 joint actions (False: 289)
         self.test_opponent = None             # e.g. {"name": "sh"}; None = record's original agent
         self.max_records = None               # cap on checkpoints loaded (None = all)
